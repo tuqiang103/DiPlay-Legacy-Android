@@ -135,43 +135,68 @@ jobs:
           test -f shared/src/main/jni/lwip/src/include/lwip/opt.h || { echo "::error::lwIP 源码缺失"; exit 1; }
 
       # CarPlay 认证材料, 优先级:
-      #   1. Secrets (MFI_IDENTITY_PK8_B64 / MFI_CERTIFICATE_P7B_B64) -- 推荐, 官方仓库已 404
-      #   2. 从 upstream_tag 指定的官方 release APK 中提取 (大概率失败, 仅保留兼容)
-      #   3. 都没有 -> 跳过并警告: APK 可正常安装, 但 CarPlay 无法连接 iPhone
+      #   1. 仓库级 Secrets (MFI_IDENTITY_PK8_B64 / MFI_CERTIFICATE_P7B_B64) -- 推荐
+      #      注意: 必须放在 Settings -> Secrets and variables -> Actions 的
+      #      "Repository secrets" 区, 而不是 Environments 区!
+      #      Environment secrets 对未声明 environment 的 job 不可见。
+      #   2. 从 upstream_tag 指定的官方 release APK 提取 (官方仓库已 404, 大概率失败)
+      #   3. 兜底: 从仍在线的社区 v0.2.68 测试包中提取 (含 MFi 身份)
+      #   都失败才跳过: APK 可正常安装, 但 CarPlay 无法连接 iPhone
       - name: Prepare MFi auth assets
         env:
           MFI_IDENTITY_PK8_B64: ${{ secrets.MFI_IDENTITY_PK8_B64 }}
           MFI_CERTIFICATE_P7B_B64: ${{ secrets.MFI_CERTIFICATE_P7B_B64 }}
-          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+          UPSTREAM_TAG: ${{ inputs.upstream_tag || 'v0.2.64' }}
         run: |
           set -uo pipefail
           mkdir -p auth-assets/offline-mfi
+          SRC=""
           if [ -n "$MFI_IDENTITY_PK8_B64" ] && [ -n "$MFI_CERTIFICATE_P7B_B64" ]; then
             echo "$MFI_IDENTITY_PK8_B64" | base64 -d > auth-assets/offline-mfi/identity.pk8
             echo "$MFI_CERTIFICATE_P7B_B64" | base64 -d > auth-assets/offline-mfi/certificate.p7b
             echo "已从 Secrets 加载 MFi 身份文件"
-          elif [ -n "$UPSTREAM_TAG" ]; then
-            URL="https://github.com/programmerguohuajing/DiPlay-Legacy-Android/releases/download/${UPSTREAM_TAG}/DiPlay-${UPSTREAM_TAG}-legacy-release.apk"
-            echo "尝试从官方 release 提取: $URL"
-            if curl -fsSL --retry 2 --retry-delay 2 -o /tmp/official.apk "$URL"; then
-              unzip -p /tmp/official.apk assets/offline-mfi/identity.pk8 > auth-assets/offline-mfi/identity.pk8
-              unzip -p /tmp/official.apk assets/offline-mfi/certificate.p7b > auth-assets/offline-mfi/certificate.p7b
-              echo "已从官方 APK 提取 MFi 身份文件"
+          else
+            # 来源 A: 官方 upstream tag (可能已 404)
+            URL_A="https://github.com/programmerguohuajing/DiPlay-Legacy-Android/releases/download/${UPSTREAM_TAG}/DiPlay-${UPSTREAM_TAG}-legacy-release.apk"
+            echo "尝试来源 A (官方 release): $URL_A"
+            if curl -fsSL --retry 2 --retry-delay 2 -o /tmp/src.apk "$URL_A"; then
+              SRC="/tmp/src.apk"
             else
-              echo "::warning::官方 release 下载失败(仓库可能已删除), 将不含 MFi 身份构建"
+              echo "::warning::官方 release 不可用(404), 改试社区兜底源"
+            fi
+            # 来源 B: 仍在线的社区 v0.2.68 测试包 (经 GitHub API 下载)
+            if [ -z "$SRC" ]; then
+              URL_B="https://api.github.com/repos/Ray-Hx/DiPlay-Legacy-Android4.4/releases/assets/709877093"
+              echo "尝试来源 B (社区 v0.2.68 测试包): $URL_B"
+              if curl -fsSL --retry 2 --retry-delay 2 \
+                   -H "Accept: application/octet-stream" \
+                   -o /tmp/src.apk "$URL_B"; then
+                SRC="/tmp/src.apk"
+              else
+                echo "::warning::社区兜底源也下载失败"
+              fi
+            fi
+            if [ -n "$SRC" ]; then
+              unzip -p "$SRC" assets/offline-mfi/identity.pk8 > auth-assets/offline-mfi/identity.pk8
+              unzip -p "$SRC" assets/offline-mfi/certificate.p7b > auth-assets/offline-mfi/certificate.p7b
+              echo "已从 APK 提取 MFi 身份文件: $SRC"
+              rm -f /tmp/src.apk
             fi
           fi
-          if [ -s auth-assets/offline-mfi/identity.pk8 ]; then
+          if [ -s auth-assets/offline-mfi/identity.pk8 ] && [ -s auth-assets/offline-mfi/certificate.p7b ]; then
             ls -l auth-assets/offline-mfi/
+            # 只在真正有身份文件时才设置该变量:
+            # Gradle 侧对"变量存在但为空"会报 Cannot convert '' to File
             echo "DIPLAY_AUTH_ASSETS_DIR=${{ github.workspace }}/auth-assets" >> "$GITHUB_ENV"
           else
-            echo "::warning::未提供 MFi 身份文件, CarPlay 认证功能不可用"
+            echo "::warning::未获得 MFi 身份文件, CarPlay 认证功能不可用"
           fi
 
       # 构建 standalone flavor 的 release 变体 (与现有 debug 工作流对应)
+      # 注意: 不要在这里显式传 DIPLAY_AUTH_ASSETS_DIR。
+      # 上一步通过 GITHUB_ENV 设置的变量会自动对后续步骤生效;
+      # 若此处用 ${{ env.* }} 重导出, 未设置时会变成空字符串导致 Gradle 报错
       - name: Build unsigned release APK
-        env:
-          DIPLAY_AUTH_ASSETS_DIR: ${{ env.DIPLAY_AUTH_ASSETS_DIR }}
         run: |
           chmod +x ./gradlew
           set +e
