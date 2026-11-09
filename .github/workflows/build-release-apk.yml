@@ -96,8 +96,23 @@ jobs:
       - name: Install SDK packages
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager --install \
+          # 部分镜像未把 sdkmanager 放进 PATH, 先在 SDK 目录里定位
+          SM="$(find "$ANDROID_HOME" -maxdepth 5 -type f -name sdkmanager 2>/dev/null | head -1)"
+          if [ -z "$SM" ]; then
+            echo "::warning::SDK 目录中没有 sdkmanager, 下载官方 cmdline-tools"
+            curl -fsSL -o /tmp/clt.zip \
+              "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+            mkdir -p "$ANDROID_HOME/cmdline-tools"
+            unzip -q /tmp/clt.zip -d "$ANDROID_HOME/cmdline-tools"
+            rm -rf "$ANDROID_HOME/cmdline-tools/latest"
+            mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+            SM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          fi
+          echo "sdkmanager: $SM"
+          echo "$(dirname "$SM")" >> "$GITHUB_PATH"
+          # 接受许可; yes 因下游关闭管道产生的 Broken pipe 属预期, 已用 || true 兜住
+          yes | "$SM" --licenses > /dev/null 2>&1 || true
+          "$SM" --install \
             "platforms;android-37.0" \
             "build-tools;36.0.0" \
             "platform-tools" \
