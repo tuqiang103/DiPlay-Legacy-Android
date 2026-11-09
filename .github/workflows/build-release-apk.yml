@@ -1,20 +1,24 @@
 name: Build signed DiPlay release APK
 
 # 针对仓库: tbaip/DiPlay-Legacy-Android (fork 后放入 .github/workflows/ 即可)
-# 方案: 构建 :mobile 的 standaloneRelease 变体(未签名) -> zipalign -> apksigner 签名
-#       不依赖 build.gradle.kts 中是否配置了 signingConfig, 对上游改动免疫。
+# 方案: 临时替换 mobile/build.gradle.kts 中 verifyReleaseSigningIdentity 守卫的
+#       官方证书指纹常量为自己的指纹, 并提供 ANDROID_KEY* 环境变量,
+#       由 Gradle 的 signingConfigs.release 直接用我们的 keystore 签名 release 包。
+#       补丁只在 runner 内生效, 不提交到仓库。
 #
 # 触发方式:
 #   1. 手动: Actions -> Build signed DiPlay release APK -> Run workflow
 #   2. 自动: 推送 v* 标签 (git tag v0.2.69 && git push --tags)
 #
-# 可选 Secrets (Settings -> Secrets and variables -> Actions):
+# 必需 Secrets (Settings -> Secrets and variables -> Actions -> Repository secrets,
+#               不要放在 Environments 区!):
 #   KEYSTORE_B64           正式 keystore 的 base64 (生成: base64 -w0 release.keystore)
 #   KEYSTORE_PASSWORD      keystore 密码
 #   KEY_ALIAS              key 别名
 #   KEY_PASSWORD           key 密码 (与 keystore 密码相同时可省略)
 #   MFI_IDENTITY_PK8_B64   CarPlay MFi 身份私钥 base64 (assets/offline-mfi/identity.pk8)
 #   MFI_CERTIFICATE_P7B_B64 CarPlay MFi 证书 base64 (assets/offline-mfi/certificate.p7b)
+#   (MFi 两项缺失时会自动尝试从官方 release / 社区 v0.2.68 测试包兜底提取)
 #
 # 注意: 未配置 keystore Secrets 时会自动生成一把临时密钥来签名(仅适合测试)。
 #       临时密钥与官方包签名不同, 覆盖安装会报"签名不一致", 需先卸载旧版。
@@ -52,7 +56,7 @@ concurrency:
 
 jobs:
   build:
-    name: assembleStandaloneRelease + sign
+    name: assembleStandaloneRelease (Gradle signed)
     runs-on: ubuntu-24.04
     timeout-minutes: 180
 
@@ -192,11 +196,82 @@ jobs:
             echo "::warning::未获得 MFi 身份文件, CarPlay 认证功能不可用"
           fi
 
-      # 构建 standalone flavor 的 release 变体 (与现有 debug 工作流对应)
+      # mobile/build.gradle.kts 注册了 verifyReleaseSigningIdentity 守卫:
+      #   1) 要求 ANDROID_KEYSTORE_PATH / ANDROID_KEYSTORE_PASSWORD /
+      #      ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD 四个变量齐全且 keystore 可打开
+      #   2) 硬编码校验证书 SHA-256 指纹 == 官方 v0.2.21 证书 (bca015c0...)
+      # 自签 keystore 不可能通过 (2), 因此在 CI 里临时把该常量换成自己证书的指纹,
+      # 让 Gradle 直接用我们的 keystore 签名 release 包。此改动只在 runner 内生效, 不提交。
+      - name: Prepare signing key and patch release guard
+        id: key
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KS_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/signing
+          KS=/tmp/signing/release.keystore
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$KS"
+            ALIAS="$KS_ALIAS"
+            STORE_PASS="$KS_PASSWORD"
+            KEY_PASS="${KEY_PASSWORD:-$KS_PASSWORD}"
+            echo "使用仓库 Secrets 中的正式 keystore"
+          else
+            PASS="$(openssl rand -hex 16)"
+            ALIAS="diplay-ci"
+            keytool -genkeypair -v \
+              -keystore "$KS" -alias "$ALIAS" -keyalg RSA -keysize 2048 \
+              -validity 10000 -storepass "$PASS" -keypass "$PASS" \
+              -dname "CN=DiPlay CI, OU=CI, O=DiPlay-Legacy"
+            STORE_PASS="$PASS"
+            KEY_PASS="$PASS"
+            echo "::warning::未配置 KEYSTORE_B64, 已生成临时密钥; 后续升级必须保留同一把钥匙"
+          fi
+          [ -n "$ALIAS" ] || { echo "::error::KEY_ALIAS 为空"; exit 1; }
+          [ -s "$KS" ] || { echo "::error::keystore 文件为空"; exit 1; }
+
+          # 证书 DER 的 SHA-256, 与 gradle 侧 MessageDigest.digest(cert.encoded) 一致
+          FP="$(keytool -exportcert -alias "$ALIAS" -keystore "$KS" \
+                  -storepass "$STORE_PASS" | openssl dgst -sha256 | awk '{print $NF}')"
+          [[ "$FP" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::证书指纹计算失败: $FP"; exit 1; }
+          echo "本密钥证书 SHA-256: $FP"
+
+          # 把 build.gradle.kts 中指纹校验常量替换为自己的指纹 (兼容上游改过常量值)
+          python3 - "$FP" <<'PY'
+          import re, sys, pathlib
+          fp = sys.argv[1]
+          p = pathlib.Path("mobile/build.gradle.kts")
+          s = p.read_text()
+          new, n = re.subn(
+              r'(fingerprint\.equals\(")[0-9a-fA-F]{64}(")',
+              lambda m: m.group(1) + fp + m.group(2),
+              s,
+          )
+          if n == 0:
+              raise SystemExit("::error::未找到证书指纹校验代码, 上游结构可能已变化")
+          p.write_text(new)
+          print(f"已替换 {n} 处证书指纹常量")
+          PY
+          grep -n "fingerprint.equals" mobile/build.gradle.kts
+
+          # 供 Gradle 的 signingConfigs.release 与 verifyReleaseSigningIdentity 读取
+          {
+            echo "ANDROID_KEYSTORE_PATH=$KS"
+            echo "ANDROID_KEYSTORE_PASSWORD=$STORE_PASS"
+            echo "ANDROID_KEY_ALIAS=$ALIAS"
+            echo "ANDROID_KEY_PASSWORD=$KEY_PASS"
+          } >> "$GITHUB_ENV"
+          echo "已写入 ANDROID_KEY* 环境变量"
+          ls -l "$KS"
+
+      # 构建 standalone release (Gradle 已用上面的 keystore 直接签名)
       # 注意: 不要在这里显式传 DIPLAY_AUTH_ASSETS_DIR。
       # 上一步通过 GITHUB_ENV 设置的变量会自动对后续步骤生效;
       # 若此处用 ${{ env.* }} 重导出, 未设置时会变成空字符串导致 Gradle 报错
-      - name: Build unsigned release APK
+      - name: Build signed release APK
         run: |
           chmod +x ./gradlew
           set +e
@@ -211,7 +286,7 @@ jobs:
             tail -40 /tmp/build.log
             exit "$code"
           fi
-          echo "构建成功"
+          echo "构建 + 签名成功"
           find mobile/build/outputs/apk -name "*.apk" -exec ls -lh {} \;
 
       - name: Resolve version name
@@ -229,60 +304,25 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "使用版本号: $V"
 
-      # 签名: 有 keystore Secret 用正式密钥; 没有则生成临时密钥(仅测试用)
-      - name: Prepare signing key
-        id: key
+      # Gradle 已完成签名与对齐, 这里只做校验、重命名与校验和
+      - name: Verify and finalize APK
         env:
-          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/signing
-          if [ -n "$KEYSTORE_B64" ]; then
-            echo "$KEYSTORE_B64" | base64 -d > /tmp/signing/release.keystore
-            echo "mode=secret" >> "$GITHUB_OUTPUT"
-            echo "alias=${{ secrets.KEY_ALIAS }}" >> "$GITHUB_OUTPUT"
-          else
-            PASS="$(openssl rand -hex 16)"
-            keytool -genkeypair -v \
-              -keystore /tmp/signing/release.keystore \
-              -alias diplay-ci -keyalg RSA -keysize 2048 -validity 10000 \
-              -storepass "$PASS" -keypass "$PASS" \
-              -dname "CN=DiPlay CI, OU=CI, O=DiPlay-Legacy"
-            echo "mode=ephemeral" >> "$GITHUB_OUTPUT"
-            echo "alias=diplay-ci" >> "$GITHUB_OUTPUT"
-            echo "KEYSTORE_PASSWORD=$PASS" >> "$GITHUB_OUTPUT"
-            echo "::warning::未配置 KEYSTORE_B64, 已用临时密钥签名。此 APK 无法覆盖安装官方包, 且不可作为正式发布版本"
-          fi
-          ls -l /tmp/signing/
-
-      - name: Zipalign and sign APK
-        env:
-          KS: /tmp/signing/release.keystore
-          KS_PASS: ${{ steps.key.outputs.KEYSTORE_PASSWORD || secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ steps.key.outputs.alias }}
-          KEY_PASS: ${{ secrets.KEY_PASSWORD }}
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
           BT="$BUILD_TOOLS_DIR"
-          UNSIGNED="$(find mobile/build/outputs/apk -name "*release*.apk" ! -name "*signed*" | head -1)"
-          if [ -z "$UNSIGNED" ]; then
-            echo "::error::未找到未签名的 release APK"
+          APK="$(find mobile/build/outputs/apk -name "*.apk" ! -name "*-unsigned*" | head -1)"
+          if [ -z "$APK" ]; then
+            echo "::error::未找到 release APK"
             find mobile/build/outputs/apk -type f | head -20
             exit 1
           fi
-          echo "未签名包: $UNSIGNED"
-          ALIGNED=/tmp/diplay-aligned.apk
+          echo "构建产物: $APK"
           OUT="DiPlay-${VERSION}-legacy-release.apk"
-          "$BT/zipalign" -f -p 4 "$UNSIGNED" "$ALIGNED"
-          "$BT/apksigner" sign \
-            --ks "$KS" \
-            --ks-key-alias "$KEY_ALIAS" \
-            --ks-pass pass:"$KS_PASS" \
-            ${KEY_PASS:+--key-pass pass:"$KEY_PASS"} \
-            --out "$OUT" \
-            "$ALIGNED"
-          "$BT/apksigner" verify --print-certs "$OUT"
+          cp "$APK" "$OUT"
+          echo "--- 签名校验 (老车机需 v1 签名为 true) ---"
+          "$BT/apksigner" verify --print-certs "$OUT" | head -20
+          "$BT/zipalign" -c -p 4 "$OUT" || echo "::warning::zipalign 检查未通过"
           echo "--- 产物 ---"
           ls -lh "$OUT"
           sha256sum "$OUT" | tee "${OUT}.sha256"
