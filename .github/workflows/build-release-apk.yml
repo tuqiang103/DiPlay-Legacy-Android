@@ -1,0 +1,270 @@
+name: Build signed DiPlay release APK
+
+# 针对仓库: tbaip/DiPlay-Legacy-Android (fork 后放入 .github/workflows/ 即可)
+# 方案: 构建 :mobile 的 standaloneRelease 变体(未签名) -> zipalign -> apksigner 签名
+#       不依赖 build.gradle.kts 中是否配置了 signingConfig, 对上游改动免疫。
+#
+# 触发方式:
+#   1. 手动: Actions -> Build signed DiPlay release APK -> Run workflow
+#   2. 自动: 推送 v* 标签 (git tag v0.2.69 && git push --tags)
+#
+# 可选 Secrets (Settings -> Secrets and variables -> Actions):
+#   KEYSTORE_B64           正式 keystore 的 base64 (生成: base64 -w0 release.keystore)
+#   KEYSTORE_PASSWORD      keystore 密码
+#   KEY_ALIAS              key 别名
+#   KEY_PASSWORD           key 密码 (与 keystore 密码相同时可省略)
+#   MFI_IDENTITY_PK8_B64   CarPlay MFi 身份私钥 base64 (assets/offline-mfi/identity.pk8)
+#   MFI_CERTIFICATE_P7B_B64 CarPlay MFi 证书 base64 (assets/offline-mfi/certificate.p7b)
+#
+# 注意: 未配置 keystore Secrets 时会自动生成一把临时密钥来签名(仅适合测试)。
+#       临时密钥与官方包签名不同, 覆盖安装会报"签名不一致", 需先卸载旧版。
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "尝试从中提取 MFi 身份的上游 release tag (其仓库已404, 建议改用 Secrets)"
+        required: false
+        default: "v0.2.64"
+      version_name:
+        description: "APK 文件名中的版本号, 如 v0.2.69; 留空则自动推断"
+        required: false
+        default: ""
+      apply_micfix_patch:
+        description: "应用音频防抖补丁 (patches/apply_audio_mode_debounce.py)"
+        type: boolean
+        required: false
+        default: false
+      create_github_release:
+        description: "将 APK 发布到本仓库 Releases 页面"
+        type: boolean
+        required: false
+        default: true
+  push:
+    tags: [ "v*" ]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: assembleStandaloneRelease + sign
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Android SDK + NDK 体积大, 先腾出磁盘空间
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      # docs/BUILD.md 要求 JDK 25
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      # runner 镜像已预装 Android SDK, 直接探测并复用
+      - name: Configure Android SDK
+        run: |
+          set -euo pipefail
+          SDK=""
+          for c in "$ANDROID_SDK_ROOT" "$ANDROID_HOME" /usr/local/lib/android/sdk; do
+            if [ -n "$c" ] && [ -d "$c" ]; then SDK="$c"; break; fi
+          done
+          if [ -z "$SDK" ]; then
+            echo "::error::未找到 Android SDK"
+            exit 1
+          fi
+          echo "使用 SDK: $SDK"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          BT="$(ls -d "$SDK"/build-tools/*/ 2>/dev/null | sort -V | tail -1)"
+          echo "BUILD_TOOLS_DIR=$BT" >> "$GITHUB_ENV"
+          echo "build-tools: $BT"
+
+      # 与 shared/build.gradle 的 ndkVersion = '25.2.9519653' 保持一致
+      - name: Install SDK packages
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager --install \
+            "platforms;android-37.0" \
+            "build-tools;36.0.0" \
+            "platform-tools" \
+            "ndk;25.2.9519653"
+          ls "$ANDROID_HOME/ndk/"
+
+      # 可选: micfix 音频补丁
+      - name: Apply micfix patch
+        if: ${{ inputs.apply_micfix_patch == true }}
+        run: python3 patches/apply_audio_mode_debounce.py
+
+      # shared 模块的原生构建会硬校验 libopus / lwIP 源码是否就位,
+      # 上游挂接缺陷导致它们不会被自动触发, 必须手动准备
+      - name: Fetch pinned native sources (libopus + lwIP)
+        run: |
+          set -euo pipefail
+          python3 scripts/prepare-libopus.py
+          python3 scripts/prepare-lwip.py
+          test -f shared/src/main/jni/libopus/opus_sources.mk || { echo "::error::libopus 源码缺失"; exit 1; }
+          test -f shared/src/main/jni/lwip/src/include/lwip/opt.h || { echo "::error::lwIP 源码缺失"; exit 1; }
+
+      # CarPlay 认证材料, 优先级:
+      #   1. Secrets (MFI_IDENTITY_PK8_B64 / MFI_CERTIFICATE_P7B_B64) -- 推荐, 官方仓库已 404
+      #   2. 从 upstream_tag 指定的官方 release APK 中提取 (大概率失败, 仅保留兼容)
+      #   3. 都没有 -> 跳过并警告: APK 可正常安装, 但 CarPlay 无法连接 iPhone
+      - name: Prepare MFi auth assets
+        env:
+          MFI_IDENTITY_PK8_B64: ${{ secrets.MFI_IDENTITY_PK8_B64 }}
+          MFI_CERTIFICATE_P7B_B64: ${{ secrets.MFI_CERTIFICATE_P7B_B64 }}
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          set -uo pipefail
+          mkdir -p auth-assets/offline-mfi
+          if [ -n "$MFI_IDENTITY_PK8_B64" ] && [ -n "$MFI_CERTIFICATE_P7B_B64" ]; then
+            echo "$MFI_IDENTITY_PK8_B64" | base64 -d > auth-assets/offline-mfi/identity.pk8
+            echo "$MFI_CERTIFICATE_P7B_B64" | base64 -d > auth-assets/offline-mfi/certificate.p7b
+            echo "已从 Secrets 加载 MFi 身份文件"
+          elif [ -n "$UPSTREAM_TAG" ]; then
+            URL="https://github.com/programmerguohuajing/DiPlay-Legacy-Android/releases/download/${UPSTREAM_TAG}/DiPlay-${UPSTREAM_TAG}-legacy-release.apk"
+            echo "尝试从官方 release 提取: $URL"
+            if curl -fsSL --retry 2 --retry-delay 2 -o /tmp/official.apk "$URL"; then
+              unzip -p /tmp/official.apk assets/offline-mfi/identity.pk8 > auth-assets/offline-mfi/identity.pk8
+              unzip -p /tmp/official.apk assets/offline-mfi/certificate.p7b > auth-assets/offline-mfi/certificate.p7b
+              echo "已从官方 APK 提取 MFi 身份文件"
+            else
+              echo "::warning::官方 release 下载失败(仓库可能已删除), 将不含 MFi 身份构建"
+            fi
+          fi
+          if [ -s auth-assets/offline-mfi/identity.pk8 ]; then
+            ls -l auth-assets/offline-mfi/
+            echo "DIPLAY_AUTH_ASSETS_DIR=${{ github.workspace }}/auth-assets" >> "$GITHUB_ENV"
+          else
+            echo "::warning::未提供 MFi 身份文件, CarPlay 认证功能不可用"
+          fi
+
+      # 构建 standalone flavor 的 release 变体 (与现有 debug 工作流对应)
+      - name: Build unsigned release APK
+        env:
+          DIPLAY_AUTH_ASSETS_DIR: ${{ env.DIPLAY_AUTH_ASSETS_DIR }}
+        run: |
+          chmod +x ./gradlew
+          set +e
+          ./gradlew :mobile:assembleStandaloneRelease --no-daemon --stacktrace \
+            --console=plain > /tmp/build.log 2>&1
+          code=$?
+          if [ "$code" -ne 0 ]; then
+            echo "::error::Gradle 退出码 $code"
+            sed -n '/What went wrong/,/^\* Try/p' /tmp/build.log | head -45
+            grep -n "FAILED" /tmp/build.log | head -25
+            grep -n -A 6 "Caused by" /tmp/build.log | head -30
+            tail -40 /tmp/build.log
+            exit "$code"
+          fi
+          echo "构建成功"
+          find mobile/build/outputs/apk -name "*.apk" -exec ls -lh {} \;
+
+      - name: Resolve version name
+        id: ver
+        run: |
+          if [ -n "${{ inputs.version_name }}" ]; then
+            V="${{ inputs.version_name }}"
+          elif [ -n "${GITHUB_REF_NAME:-}" ] && [[ "${GITHUB_REF_NAME}" == v* ]]; then
+            V="${GITHUB_REF_NAME}"
+          elif [ -n "${{ inputs.upstream_tag }}" ]; then
+            V="${{ inputs.upstream_tag }}"
+          else
+            V="manual-${{ github.run_number }}"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "使用版本号: $V"
+
+      # 签名: 有 keystore Secret 用正式密钥; 没有则生成临时密钥(仅测试用)
+      - name: Prepare signing key
+        id: key
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/signing
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > /tmp/signing/release.keystore
+            echo "mode=secret" >> "$GITHUB_OUTPUT"
+            echo "alias=${{ secrets.KEY_ALIAS }}" >> "$GITHUB_OUTPUT"
+          else
+            PASS="$(openssl rand -hex 16)"
+            keytool -genkeypair -v \
+              -keystore /tmp/signing/release.keystore \
+              -alias diplay-ci -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$PASS" -keypass "$PASS" \
+              -dname "CN=DiPlay CI, OU=CI, O=DiPlay-Legacy"
+            echo "mode=ephemeral" >> "$GITHUB_OUTPUT"
+            echo "alias=diplay-ci" >> "$GITHUB_OUTPUT"
+            echo "KEYSTORE_PASSWORD=$PASS" >> "$GITHUB_OUTPUT"
+            echo "::warning::未配置 KEYSTORE_B64, 已用临时密钥签名。此 APK 无法覆盖安装官方包, 且不可作为正式发布版本"
+          fi
+          ls -l /tmp/signing/
+
+      - name: Zipalign and sign APK
+        env:
+          KS: /tmp/signing/release.keystore
+          KS_PASS: ${{ steps.key.outputs.KEYSTORE_PASSWORD || secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ steps.key.outputs.alias }}
+          KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          BT="$BUILD_TOOLS_DIR"
+          UNSIGNED="$(find mobile/build/outputs/apk -name "*release*.apk" ! -name "*signed*" | head -1)"
+          if [ -z "$UNSIGNED" ]; then
+            echo "::error::未找到未签名的 release APK"
+            find mobile/build/outputs/apk -type f | head -20
+            exit 1
+          fi
+          echo "未签名包: $UNSIGNED"
+          ALIGNED=/tmp/diplay-aligned.apk
+          OUT="DiPlay-${VERSION}-legacy-release.apk"
+          "$BT/zipalign" -f -p 4 "$UNSIGNED" "$ALIGNED"
+          "$BT/apksigner" sign \
+            --ks "$KS" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass pass:"$KS_PASS" \
+            ${KEY_PASS:+--key-pass pass:"$KEY_PASS"} \
+            --out "$OUT" \
+            "$ALIGNED"
+          "$BT/apksigner" verify --print-certs "$OUT"
+          echo "--- 产物 ---"
+          ls -lh "$OUT"
+          sha256sum "$OUT" | tee "${OUT}.sha256"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DiPlay-${{ steps.ver.outputs.version }}-legacy-release-apk
+          path: |
+            DiPlay-*.apk
+            DiPlay-*.sha256
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish to GitHub Releases
+        if: ${{ startsWith(github.ref, 'refs/tags/') || inputs.create_github_release == true }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.version }}
+          name: DiPlay ${{ steps.ver.outputs.version }} (signed release)
+          draft: false
+          prerelease: true
+          files: |
+            DiPlay-*.apk
+            DiPlay-*.sha256
